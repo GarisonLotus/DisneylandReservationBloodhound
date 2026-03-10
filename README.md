@@ -35,10 +35,15 @@ playwright install chromium
 
 ## Configuration
 
-```bash
-# Copy the example config
-cp .env.example .env
+On first run, if no `.env` file is found, the script will walk you through an
+interactive setup wizard that asks for your credentials and preferences, then
+saves a `.env` file for you. On subsequent runs it skips straight to the
+reservation check.
 
+You can also set up manually:
+
+```bash
+cp .env.example .env
 # Edit with your credentials and preferences
 ```
 

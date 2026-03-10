@@ -4,12 +4,21 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from src.models import Park
+
+
+class DateRangeError(Exception):
+    """Raised when TARGET_DATE is outside the valid reservation window."""
+
+    def __init__(self, message: str, target_date: str, max_date: date | None = None):
+        super().__init__(message)
+        self.target_date = target_date
+        self.max_date = max_date
 
 
 @dataclass(frozen=True)
@@ -54,7 +63,23 @@ def load_config(env_path: str | None = None) -> AppConfig:
         errors.append("TARGET_DATE is required")
     else:
         try:
-            datetime.strptime(target_date, "%Y-%m-%d")
+            parsed = datetime.strptime(target_date, "%Y-%m-%d").date()
+            today = date.today()
+            max_date = today + timedelta(days=90)
+            if parsed < today:
+                raise DateRangeError(
+                    f"Your target date ({target_date}) is in the past.",
+                    target_date=target_date,
+                )
+            elif parsed > max_date:
+                raise DateRangeError(
+                    f"Your target date ({target_date}) is more than 90 days away. "
+                    f"Disneyland only allows reservations up to 90 days in advance.",
+                    target_date=target_date,
+                    max_date=max_date,
+                )
+        except DateRangeError:
+            raise
         except ValueError:
             errors.append(f"TARGET_DATE must be YYYY-MM-DD format, got: {target_date}")
 

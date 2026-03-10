@@ -1,5 +1,6 @@
 """Login flow, auth token capture via network intercepts, and token caching."""
 
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -180,32 +181,43 @@ class AuthManager:
         # Submit
         await login_frame.click(LOGIN_SUBMIT_BUTTON)
 
-        # Wait for navigation to complete (login redirect)
-        try:
-            await page.wait_for_url("**/entry-reservation/**", timeout=LOGIN_TIMEOUT_MS)
-            logger.info("Login successful - redirected to reservations page")
-        except Exception:
-            # Check for error messages
-            try:
-                error_el = await page.query_selector(LOGIN_ERROR)
-                if error_el:
-                    error_text = await error_el.inner_text()
-                    raise AuthError(f"Login failed: {error_text}")
-            except AuthError:
-                raise
-            except Exception:
-                pass
+        # Poll for either success (redirect) or failure (error message / CAPTCHA)
+        # instead of blocking on wait_for_url for the full timeout.
+        deadline = asyncio.get_event_loop().time() + (LOGIN_TIMEOUT_MS / 1000)
+        while asyncio.get_event_loop().time() < deadline:
+            # Success: redirected to reservations page
+            if "entry-reservation" in page.url:
+                logger.info("Login successful - redirected to reservations page")
+                return
 
-            # Check CAPTCHA again
-            if await self._detect_captcha(page):
-                raise CaptchaError("CAPTCHA appeared after login attempt.")
-
-            # Check if we landed on a logged-in page anyway
+            # Success: detected logged-in indicator
             if await self._check_already_logged_in(page):
                 logger.info("Login successful (detected via indicator)")
                 return
 
-            raise AuthError("Login failed: did not redirect to reservations page")
+            # Failure: error message on page (bad credentials, account locked, etc.)
+            for frame in (login_frame, page):
+                try:
+                    error_el = await frame.query_selector(LOGIN_ERROR)
+                    if error_el:
+                        error_text = (await error_el.inner_text()).strip()
+                        if error_text:
+                            raise AuthError(f"Login failed: {error_text}")
+                except AuthError:
+                    raise
+                except Exception:
+                    pass
+
+            # Failure: CAPTCHA appeared
+            if await self._detect_captcha(page):
+                raise CaptchaError("CAPTCHA appeared after login attempt.")
+
+            await asyncio.sleep(1)
+
+        raise AuthError(
+            "Login failed: timed out waiting for redirect. "
+            "Check your credentials or try running with --headless false."
+        )
 
     async def ensure_authenticated(self, page: Page) -> None:
         """Ensure we have a valid session, re-authenticating if needed."""

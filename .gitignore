@@ -1,4 +1,6 @@
 .env
+.token_cache.json
+.claude/
 __pycache__/
 *.pyc
 browser_data/

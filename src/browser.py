@@ -39,6 +39,7 @@ class BrowserManager:
         self._playwright = await async_playwright().start()
         self._context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=str(data_dir),
+            channel="chrome",
             headless=self.config.headless,
             user_agent=USER_AGENT,
             viewport=VIEWPORT,
@@ -47,6 +48,8 @@ class BrowserManager:
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
+                "--disable-http2",
+                "--disable-quic",
             ],
         )
 

@@ -40,12 +40,6 @@ def parse_args() -> argparse.Namespace:
         help="Target park. Overrides .env.",
     )
     parser.add_argument(
-        "--party-size",
-        type=int,
-        default=None,
-        help="Number of guests. Overrides .env.",
-    )
-    parser.add_argument(
         "--headless",
         choices=["true", "false"],
         default=None,
@@ -74,8 +68,6 @@ def apply_cli_overrides(config: AppConfig, args: argparse.Namespace) -> AppConfi
         overrides["target_date"] = args.date
     if args.park is not None:
         overrides["target_park"] = Park.from_str(args.park)
-    if args.party_size is not None:
-        overrides["party_size"] = args.party_size
     if args.headless is not None:
         overrides["headless"] = args.headless.lower() == "true"
     if args.interval is not None:
@@ -140,10 +132,92 @@ async def async_main(config: AppConfig) -> None:
         logger.info("Shutdown complete")
 
 
+# ANSI color codes — 1970s amber terminal aesthetic
+_AMBER = "\033[33m"
+_BRIGHT = "\033[93m"
+_DIM = "\033[2m"
+_RESET = "\033[0m"
+_BOLD = "\033[1m"
+
+BANNER = f"""{_BRIGHT}\
+                          (  ) (@@) ( )  (@)  ()    @@    O
+                     (@@@)  (  )
+                 (    )
+              (@@@@)
+            (   )
+        ====        ________                ___________
+    _D _|  |_______/        \\__I_I_____===__|___________|
+     |(_)---  |   H\\________/ |   |        =|___ ___|
+     /     |  |   H  |  |     |   |         ||_| |_||
+    |      |  |   H  |__--------------------| [___] |
+    | ________|___H__/__|_____/[][]~\\_______|       |
+    |/ |   |-----------I_____I [][] []  D   |=======|__
+  {_AMBER}__{_BRIGHT}/ =| o |=-~~\\  /~~\\  /~~\\  /~~\\ ____Y___________|__{_AMBER}__{_BRIGHT}
+ {_AMBER}|{_BRIGHT}/-=|___|=    ||    ||    ||    |_____/~\\___/        {_AMBER}|{_BRIGHT}
+  {_AMBER}\\_/{_BRIGHT}   \\_/  \\__/  \\__/  \\__/  \\__/      \\_/            {_AMBER}\\/{_RESET}
+{_DIM}{_AMBER}\
+  ╔══════════════════════════════════════════════════════╗
+  ║{_RESET}{_AMBER}  D I S N E Y L A N D   R A I L R O A D            {_DIM}║
+  ║{_RESET}{_AMBER}  R E S E R V A T I O N   B L O O D H O U N D     {_DIM}║
+  ╚══════════════════════════════════════════════════════╝{_RESET}
+"""
+
+DISCLAIMER = f"""\
+{_DIM}{_AMBER}========================================================================
+                         DISCLAIMER
+========================================================================{_RESET}
+{_AMBER}
+This software is licensed under the MIT License. See the LICENSE file
+for full terms. Key provisions:
+
+  - This software is provided "AS IS", WITHOUT WARRANTY OF ANY KIND,
+    express or implied. In no event shall the authors or copyright
+    holders be liable for any claim, damages, or other liability
+    arising from the use of this software.
+
+By proceeding, you additionally acknowledge and agree that:
+
+  1. You use this tool entirely at your own risk. The author(s) accept
+     no responsibility for any damages, account restrictions, financial
+     losses, or other consequences arising from its use.
+
+  2. This tool automates interactions with The Walt Disney Company's
+     websites and services. You represent that you have read,
+     understood, and agree to be bound by all applicable Walt Disney
+     Company Terms of Use, including any terms and conditions
+     presented during the reservation process.
+
+  3. You are solely responsible for ensuring your use of this tool
+     complies with all applicable laws, regulations, and The Walt
+     Disney Company's Terms of Use.
+{_DIM}
+========================================================================{_RESET}
+"""
+
+
+def confirm_disclaimer() -> None:
+    """Display banner and disclaimer, require user confirmation before proceeding."""
+    print(BANNER)
+    print(DISCLAIMER)
+    try:
+        response = input(f"{_AMBER}Do you accept these terms? (yes/no): {_RESET}").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print("\nAborted.")
+        sys.exit(0)
+
+    if response not in ("yes", "y"):
+        print("You must accept the terms to use this tool. Exiting.")
+        sys.exit(0)
+
+    print()
+
+
 def main() -> None:
     args = parse_args()
     config = load_config(args.env_file)
     config = apply_cli_overrides(config, args)
+
+    confirm_disclaimer()
 
     setup_logging(config.log_level)
 

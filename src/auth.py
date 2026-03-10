@@ -15,6 +15,7 @@ from src.models import TokenInfo
 from src.selectors import (
     CAPTCHA_INDICATORS,
     LOGGED_IN_INDICATORS,
+    LOGIN_EMAIL_CONTINUE_BUTTON,
     LOGIN_EMAIL_INPUT,
     LOGIN_ERROR,
     LOGIN_IFRAME,
@@ -141,7 +142,7 @@ class AuthManager:
         # Set up network intercept for token capture
         page.on("response", self._capture_token_from_response)
 
-        await page.goto(DISNEY_LOGIN_URL, wait_until="networkidle")
+        await page.goto(DISNEY_LOGIN_URL, wait_until="domcontentloaded")
 
         # Check if already logged in (persistent context may have valid session)
         if await self._check_already_logged_in(page):
@@ -159,9 +160,15 @@ class AuthManager:
         except Exception:
             logger.debug("No login iframe found, using main page")
 
-        # Fill credentials
+        # Step 1: Enter email
         await login_frame.wait_for_selector(LOGIN_EMAIL_INPUT, timeout=LOGIN_TIMEOUT_MS)
         await login_frame.fill(LOGIN_EMAIL_INPUT, self.config.disney_email)
+
+        # Step 2: Click continue to advance to password step
+        await login_frame.click(LOGIN_EMAIL_CONTINUE_BUTTON)
+
+        # Step 3: Wait for password field and fill it
+        await login_frame.wait_for_selector(LOGIN_PASSWORD_INPUT, timeout=LOGIN_TIMEOUT_MS)
         await login_frame.fill(LOGIN_PASSWORD_INPUT, self.config.disney_password)
 
         # Check for CAPTCHA before submitting
@@ -212,7 +219,7 @@ class AuthManager:
         # Try navigating to reservation page to check session
         current_url = page.url
         if "entry-reservation" not in current_url:
-            await page.goto(DISNEY_RESERVATIONS_URL, wait_until="networkidle")
+            await page.goto(DISNEY_RESERVATIONS_URL, wait_until="domcontentloaded")
 
         if await self._check_already_logged_in(page):
             return

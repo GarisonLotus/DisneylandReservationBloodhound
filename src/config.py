@@ -18,8 +18,12 @@ class AppConfig:
     disney_password: str
     target_date: str
     target_park: Park
-    party_size: int
+    party_members: list[str]
     mode: str  # "monitor" or "book"
+
+    @property
+    def party_size(self) -> int:
+        return len(self.party_members)
     poll_interval_seconds: int
     discord_webhook_url: str
     enable_macos_notifications: bool
@@ -29,6 +33,7 @@ class AppConfig:
     token_refresh_minutes: int
     max_retries: int
     log_level: str
+    debug_images: bool
 
 
 def load_config(env_path: str | None = None) -> AppConfig:
@@ -60,9 +65,10 @@ def load_config(env_path: str | None = None) -> AppConfig:
         errors.append(f"TARGET_PARK must be one of: disneyland, california_adventure, either. Got: {park_str}")
         target_park = Park.DISNEYLAND
 
-    party_size = int(os.getenv("PARTY_SIZE", "2"))
-    if party_size < 1:
-        errors.append("PARTY_SIZE must be at least 1")
+    party_members_str = os.getenv("PARTY_MEMBERS", "")
+    party_members = [name.strip() for name in party_members_str.split(",") if name.strip()]
+    if not party_members:
+        errors.append("PARTY_MEMBERS is required (comma-separated names)")
 
     mode = os.getenv("MODE", "monitor").lower()
     if mode not in ("monitor", "book"):
@@ -84,6 +90,7 @@ def load_config(env_path: str | None = None) -> AppConfig:
     token_refresh = int(os.getenv("TOKEN_REFRESH_MINUTES", "12"))
     max_retries = int(os.getenv("MAX_RETRIES", "3"))
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
+    debug_images = os.getenv("DEBUG_IMAGES", "false").lower() == "true"
 
     if errors:
         print("Configuration errors:", file=sys.stderr)
@@ -99,7 +106,7 @@ def load_config(env_path: str | None = None) -> AppConfig:
         disney_password=password,
         target_date=target_date,
         target_park=target_park,
-        party_size=party_size,
+        party_members=party_members,
         mode=mode,
         poll_interval_seconds=poll_interval,
         discord_webhook_url=discord_url,
@@ -110,6 +117,7 @@ def load_config(env_path: str | None = None) -> AppConfig:
         token_refresh_minutes=token_refresh,
         max_retries=max_retries,
         log_level=log_level,
+        debug_images=debug_images,
     )
 
 

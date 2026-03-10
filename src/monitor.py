@@ -18,10 +18,12 @@ from src.constants import (
 )
 from src.models import AvailabilityResult, AvailabilityStatus, BookingTarget, Park
 from src.selectors import (
+    BOOK_RESERVATION_BUTTON,
     CALENDAR_CONTAINER,
     CALENDAR_DAY_AVAILABLE,
     CALENDAR_DAY_BY_DATE,
     LOADING_SPINNER,
+    PARTY_NEXT_BUTTON,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,7 @@ class AvailabilityMonitor:
         self.config = config
         self.auth = auth_manager
         self.browser = browser_manager
+        self._on_calendar_page = False
 
     async def check_availability(self, target: BookingTarget) -> list[AvailabilityResult]:
         """Check availability for the target date/park. Returns results for each park checked."""
@@ -173,69 +176,32 @@ class AvailabilityMonitor:
         return False
 
     async def _check_via_browser(self, target: BookingTarget) -> list[AvailabilityResult]:
-        """Check availability by loading the reservation calendar in the browser."""
+        """Check availability by loading the reservation calendar in the browser.
+
+        First check: full navigation flow (reservations → party → calendar).
+        Subsequent checks: stay on calendar page and click "Refresh Calendar".
+        """
         page = await self.browser.get_page()
         parks_to_check = self._get_parks_to_check(target.park)
         results = []
 
         try:
-            await self.auth.ensure_authenticated(page)
-            await page.goto(DISNEY_RESERVATIONS_URL, wait_until="networkidle")
+            if self._on_calendar_page and "select-date" in page.url:
+                # Subsequent check — refresh the calendar in place
+                await self._refresh_calendar(page)
+            else:
+                # First check — full navigation flow
+                await self._navigate_to_calendar(page)
 
-            # Wait for calendar to load
-            try:
-                await page.wait_for_selector(
-                    CALENDAR_CONTAINER,
-                    timeout=ELEMENT_WAIT_TIMEOUT_MS,
-                )
-            except Exception:
-                logger.warning("Calendar container not found on page")
-                return [AvailabilityResult(
-                    date=target.date,
-                    park=target.park,
-                    status=AvailabilityStatus.ERROR,
-                    source="browser",
-                    message="Calendar not found on page",
-                )]
+            # Extract and log the "Availability as of..." timestamp
+            await self._log_availability_timestamp(page)
 
-            # Wait for loading spinners to disappear
-            try:
-                await page.wait_for_selector(
-                    LOADING_SPINNER,
-                    state="hidden",
-                    timeout=ELEMENT_WAIT_TIMEOUT_MS,
-                )
-            except Exception:
-                pass  # Spinner may not exist
-
-            # Navigate to the correct month if needed
-            await self._navigate_to_month(page, target.date)
-
-            # Check for the target date
-            for park in parks_to_check:
-                date_selector = CALENDAR_DAY_BY_DATE.format(date=target.date)
-                day_el = await page.query_selector(date_selector)
-
-                if day_el:
-                    # Check if the day element indicates availability
-                    is_available = await self._is_day_available(page, day_el, target.date)
-                    results.append(AvailabilityResult(
-                        date=target.date,
-                        park=park,
-                        status=AvailabilityStatus.AVAILABLE if is_available else AvailabilityStatus.UNAVAILABLE,
-                        source="browser",
-                    ))
-                else:
-                    results.append(AvailabilityResult(
-                        date=target.date,
-                        park=park,
-                        status=AvailabilityStatus.UNKNOWN,
-                        source="browser",
-                        message="Date element not found in calendar",
-                    ))
+            # Read availability from the calendar
+            results = await self._read_calendar_availability(page, target, parks_to_check)
 
         except Exception as e:
             logger.error("Browser availability check failed: %s", e)
+            self._on_calendar_page = False
             results.append(AvailabilityResult(
                 date=target.date,
                 park=target.park,
@@ -246,27 +212,348 @@ class AvailabilityMonitor:
 
         return results
 
+    async def _navigate_to_calendar(self, page: Page) -> None:
+        """Full navigation: reservations list → party selection → calendar page."""
+        await self.auth.ensure_authenticated(page)
+        await page.goto(DISNEY_RESERVATIONS_URL, wait_until="domcontentloaded")
+
+        # Click "Book Theme Park Reservation" to reach the booking flow
+        try:
+            book_btn = await page.wait_for_selector(BOOK_RESERVATION_BUTTON, timeout=ELEMENT_WAIT_TIMEOUT_MS)
+            if book_btn:
+                async with page.expect_navigation(wait_until="domcontentloaded", timeout=ELEMENT_WAIT_TIMEOUT_MS):
+                    await book_btn.click()
+                logger.info("Navigated to booking page: %s", page.url)
+        except Exception as e:
+            logger.debug("Book reservation button navigation: %s", e)
+
+        # Select party members and click Next
+        if "select-party" in page.url:
+            await self._select_party_members(page)
+
+        # Wait for calendar page to load
+        await self._wait_for_calendar(page)
+
+    async def _refresh_calendar(self, page: Page) -> None:
+        """Click 'Refresh Calendar' link to reload availability data in place."""
+        logger.debug("Refreshing calendar...")
+        try:
+            refresh_link = page.locator('text=/Refresh Calendar/i').first
+            if await refresh_link.count() > 0:
+                await refresh_link.click()
+                # Wait for calendar data to reload
+                await page.wait_for_timeout(2000)
+                # Wait for any loading indicators to clear
+                try:
+                    await page.wait_for_selector(
+                        LOADING_SPINNER, state="hidden", timeout=ELEMENT_WAIT_TIMEOUT_MS,
+                    )
+                except Exception:
+                    pass
+                await page.wait_for_timeout(1000)
+            else:
+                logger.warning("Refresh Calendar link not found, doing full navigation")
+                self._on_calendar_page = False
+                await self._navigate_to_calendar(page)
+        except Exception as e:
+            logger.warning("Calendar refresh failed (%s), doing full navigation", e)
+            self._on_calendar_page = False
+            await self._navigate_to_calendar(page)
+
+    async def _wait_for_calendar(self, page: Page) -> None:
+        """Wait for the calendar/date selection page to fully load."""
+        from pathlib import Path
+        from src.constants import SCREENSHOT_DIR
+
+        try:
+            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_timeout(3000)  # let JS render
+            await page.locator('text=/Select a Date/i').first.wait_for(timeout=ELEMENT_WAIT_TIMEOUT_MS)
+            self._on_calendar_page = True
+            logger.info("Calendar page loaded: %s", page.url)
+        except Exception:
+            self._on_calendar_page = False
+            if self.config.debug_images:
+                Path(SCREENSHOT_DIR).mkdir(parents=True, exist_ok=True)
+                screenshot_path = f"{SCREENSHOT_DIR}/calendar_not_found.png"
+                await page.screenshot(path=screenshot_path, full_page=True)
+                logger.warning(
+                    "Calendar page not found. Screenshot saved to %s. URL: %s",
+                    screenshot_path, page.url,
+                )
+            raise Exception("Calendar page not found")
+
+    async def _log_availability_timestamp(self, page: Page) -> None:
+        """Extract and log the 'Availability as of...' timestamp from the calendar page."""
+        try:
+            ts_locator = page.locator('text=/Availability as of/i').first
+            if await ts_locator.count() > 0:
+                ts_text = await ts_locator.inner_text()
+                logger.info("Calendar data: %s", ts_text.strip())
+            else:
+                # Try extracting via JS from shadow DOM
+                ts_text = await page.evaluate('''() => {
+                    function walkShadow(root) {
+                        const els = root.querySelectorAll ? root.querySelectorAll('*') : [];
+                        for (const el of els) {
+                            const text = el.textContent || '';
+                            if (text.includes('Availability as of') && el.children.length === 0) {
+                                return text.trim();
+                            }
+                            if (el.shadowRoot) {
+                                const found = walkShadow(el.shadowRoot);
+                                if (found) return found;
+                            }
+                        }
+                        return null;
+                    }
+                    return walkShadow(document);
+                }''')
+                if ts_text:
+                    logger.info("Calendar data: %s", ts_text)
+                else:
+                    logger.debug("Could not find availability timestamp on page")
+        except Exception:
+            logger.debug("Could not extract availability timestamp")
+
+    async def _read_calendar_availability(
+        self, page: Page, target: BookingTarget, parks_to_check: list[Park],
+    ) -> list[AvailabilityResult]:
+        """Read availability for the target date from the calendar DOM."""
+        from pathlib import Path
+        from src.constants import SCREENSHOT_DIR
+        if self.config.debug_images:
+            Path(SCREENSHOT_DIR).mkdir(parents=True, exist_ok=True)
+            await page.screenshot(path=f"{SCREENSHOT_DIR}/calendar_page.png", full_page=True)
+
+        results = []
+
+        # Check availability using <com-calendar-date> elements.
+        # The slotted version (slot="YYYY-MM-DD") has real availability info.
+        # Class values: "all" (either park), "blocked" (blocked out), "noInfo" (no data)
+        date_locator = page.locator(
+            f'com-calendar-date[slot="{target.date}"]'
+        )
+        date_count = await date_locator.count()
+        logger.info("Found %d com-calendar-date elements for %s", date_count, target.date)
+
+        if date_count == 0:
+            logger.warning("Target date %s not found on calendar", target.date)
+            for park in parks_to_check:
+                results.append(AvailabilityResult(
+                    date=target.date,
+                    park=park,
+                    status=AvailabilityStatus.UNAVAILABLE,
+                    source="browser",
+                    message="Date not found on calendar",
+                ))
+        else:
+            handle = await date_locator.first.element_handle()
+            date_info = await handle.evaluate('''(el) => {
+                return {
+                    class: el.className || '',
+                    date: el.getAttribute('date'),
+                    ariaLabel: el.getAttribute('aria-label') || '',
+                    ariaDisabled: el.getAttribute('aria-disabled'),
+                    disabled: el.hasAttribute('disabled'),
+                    unavailable: el.hasAttribute('unavailable'),
+                };
+            }''')
+            logger.info("Date %s info: %s", target.date, date_info)
+
+            css_class = date_info.get('class', '')
+            aria_label = date_info.get('ariaLabel', '').lower()
+            is_disabled = date_info.get('disabled', False)
+            is_unavailable = date_info.get('unavailable', False)
+
+            # Determine per-park availability from the class and aria-label
+            available_parks = set()
+            if not is_disabled and not is_unavailable and css_class != 'noInfo':
+                if css_class == 'all' or 'either park' in aria_label:
+                    available_parks = {Park.DISNEYLAND, Park.CALIFORNIA_ADVENTURE}
+                elif 'disneyland park' in aria_label and 'california' not in aria_label:
+                    available_parks = {Park.DISNEYLAND}
+                elif 'california adventure' in aria_label:
+                    available_parks = {Park.CALIFORNIA_ADVENTURE}
+                elif css_class not in ('blocked', 'noInfo', ''):
+                    # Unknown class but not blocked — assume available
+                    available_parks = {Park.DISNEYLAND, Park.CALIFORNIA_ADVENTURE}
+
+            for park in parks_to_check:
+                is_available = park in available_parks
+                results.append(AvailabilityResult(
+                    date=target.date,
+                    park=park,
+                    status=AvailabilityStatus.AVAILABLE if is_available else AvailabilityStatus.UNAVAILABLE,
+                    source="browser",
+                ))
+
+        return results
+
+    async def _select_party_members(self, page: Page) -> None:
+        """Select configured party members by name and click Next."""
+        from pathlib import Path
+        from src.constants import SCREENSHOT_DIR
+
+        party_names = self.config.party_members
+        logger.info("Selecting party members: %s", party_names)
+        logger.info("Current URL: %s", page.url)
+
+        # Wait for page content to render
+        await page.wait_for_load_state("domcontentloaded")
+        await page.wait_for_timeout(3000)  # allow JS to render
+
+        # Screenshot to see what's on the page before searching for names
+        if self.config.debug_images:
+            Path(SCREENSHOT_DIR).mkdir(parents=True, exist_ok=True)
+            await page.screenshot(path=f"{SCREENSHOT_DIR}/party_page.png", full_page=True)
+            logger.info("Saved party page screenshot to %s/party_page.png", SCREENSHOT_DIR)
+
+        # The party content may be in an iframe — find the right frame
+        target_frame = page
+        first_name = party_names[0]
+
+        # Check all frames (main page + iframes) for party member names
+        all_frames = [page] + page.frames
+        for frame in all_frames:
+            try:
+                # Use case-insensitive regex to match names (Disney shows ALL CAPS)
+                locator = frame.locator(f'text=/{first_name}/i')
+                count = await locator.count()
+                if count > 0:
+                    target_frame = frame
+                    frame_name = frame.name or frame.url
+                    logger.info("Found party members in frame: %s", frame_name)
+                    break
+            except Exception:
+                continue
+        else:
+            # No frame had the name — save debug info and raise
+            if self.config.debug_images:
+                await page.screenshot(path=f"{SCREENSHOT_DIR}/party_name_not_found.png", full_page=True)
+            frame_urls = [f.url for f in all_frames]
+            logger.error(
+                "Party member '%s' not found in any frame. Frames: %s. URL: %s",
+                first_name, frame_urls, page.url,
+            )
+            raise Exception(f"Party member '{first_name}' not found on page or in any iframe")
+
+        # Disney uses <com-checkbox> custom web components with Shadow DOM.
+        # Playwright's text locator finds the <h3> inside, but inner_text() on
+        # the com-checkbox returns empty (slotted content). Strategy:
+        # 1. Find the <h3> name element via Playwright's shadow-piercing locator
+        # 2. Get element handle → walk up DOM to parent com-checkbox
+        # 3. Click the checkbox input inside its shadow root
+        for name in party_names:
+            name_locator = target_frame.locator(f'text=/{name}/i').first
+            count = await name_locator.count()
+            if count == 0:
+                logger.warning("Party member not found on page: %s", name)
+                continue
+
+            handle = await name_locator.element_handle()
+            clicked = await handle.evaluate('''(el) => {
+                // Walk up from the <h3> to find the parent <com-checkbox>
+                let node = el;
+                while (node) {
+                    if (node.tagName && node.tagName.toLowerCase() === 'com-checkbox') {
+                        // Try clicking the actual input inside shadow DOM
+                        if (node.shadowRoot) {
+                            const input = node.shadowRoot.querySelector('input[type="checkbox"]');
+                            if (input) {
+                                input.click();
+                                return 'input';
+                            }
+                            // Try any clickable indicator element
+                            const indicator = node.shadowRoot.querySelector(
+                                '.checkbox-indicator, .checkbox-icon, [role="checkbox"], .check'
+                            );
+                            if (indicator) {
+                                indicator.click();
+                                return 'indicator';
+                            }
+                        }
+                        // Fallback: click the com-checkbox itself
+                        node.click();
+                        return 'element';
+                    }
+                    // Cross shadow DOM boundary if needed
+                    if (!node.parentElement && node.getRootNode() !== document) {
+                        node = node.getRootNode().host;
+                    } else {
+                        node = node.parentElement;
+                    }
+                }
+                // Last resort: click the original element with force
+                el.click();
+                return 'direct';
+            }''')
+            logger.info("Selected party member: %s (click method: %s)", name, clicked)
+
+        await page.wait_for_timeout(500)  # let selections register
+
+        # Take a screenshot to verify selections
+        if self.config.debug_images:
+            await page.screenshot(path=f"{SCREENSHOT_DIR}/party_selected.png", full_page=True)
+
+        # Click Next button — also inside Shadow DOM custom components.
+        # Use Playwright's shadow-piercing locator to find a visible button.
+        next_clicked = False
+        for selector in [
+            'button:visible:has-text("Next")',
+            'com-button:has-text("Next")',
+            '[role="button"]:has-text("Next")',
+        ]:
+            try:
+                btn = target_frame.locator(selector).first
+                if await btn.count() > 0:
+                    async with page.expect_navigation(wait_until="domcontentloaded", timeout=ELEMENT_WAIT_TIMEOUT_MS):
+                        await btn.click(force=True)
+                    next_clicked = True
+                    logger.info("Proceeded to next page: %s", page.url)
+                    break
+            except Exception as e:
+                logger.debug("Next button selector '%s' failed: %s", selector, e)
+                continue
+
+        if not next_clicked:
+            if self.config.debug_images:
+                # Screenshot to debug what the Next button looks like
+                await page.screenshot(path=f"{SCREENSHOT_DIR}/next_button_not_found.png", full_page=True)
+            logger.warning("Could not find Next button. URL: %s", page.url)
+
     async def _navigate_to_month(self, page: Page, target_date: str) -> None:
-        """Navigate the calendar to the month containing the target date."""
-        from src.selectors import CALENDAR_MONTH_LABEL, CALENDAR_NEXT_MONTH
+        """Navigate the calendar to the month containing the target date.
+
+        Uses Playwright locators (not query_selector) to pierce Shadow DOM.
+        First checks if the target date element is already visible, then
+        falls back to reading month aria-labels and clicking next.
+        """
+        from src.selectors import CALENDAR_NEXT_MONTH
 
         target_dt = datetime.strptime(target_date, "%Y-%m-%d")
-        target_month_year = target_dt.strftime("%B %Y")  # e.g., "April 2026"
+        target_month_year = target_dt.strftime("%B %Y")  # e.g., "March 2026"
 
         for _ in range(12):  # max 12 months forward
-            try:
-                month_label_el = await page.query_selector(CALENDAR_MONTH_LABEL)
-                if month_label_el:
-                    label_text = await month_label_el.inner_text()
-                    if target_month_year.lower() in label_text.lower():
-                        return
-            except Exception:
-                pass
+            # Shortcut: if the target date element is already on the page, we're done
+            date_locator = page.locator(f'com-calendar-date[slot="{target_date}"]')
+            if await date_locator.count() > 0:
+                logger.debug("Target date %s already visible on calendar", target_date)
+                return
 
-            # Click next month
+            # Check month labels using Playwright locator (pierces Shadow DOM)
+            month_labels = page.locator('.month[aria-label]')
+            count = await month_labels.count()
+            for i in range(count):
+                aria_label = await month_labels.nth(i).get_attribute('aria-label')
+                if aria_label and target_month_year.lower() in aria_label.lower():
+                    logger.debug("Found target month: %s", aria_label)
+                    return
+
+            # Click next month using locator (pierces Shadow DOM)
             try:
-                next_btn = await page.query_selector(CALENDAR_NEXT_MONTH)
-                if next_btn:
+                next_btn = page.locator(CALENDAR_NEXT_MONTH).first
+                if await next_btn.count() > 0:
                     await next_btn.click()
                     await page.wait_for_timeout(500)
                 else:
